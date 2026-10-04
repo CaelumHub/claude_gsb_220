@@ -264,6 +264,92 @@ class Storage:
     def get_analysis(self, file_id: str, kind: str) -> Optional[Dict[str, Any]]:
         return read_json(self._analysis_path(file_id, kind), None)
 
+    # -- waveform markers ------------------------------------------------- #
+    #
+    # Markers are stored as a regular analysis document of kind "markers"
+    # (``data/analysis/<file_id>__markers.json``), so they inherit atomic
+    # writes, advisory locking and automatic cleanup when the audio file is
+    # deleted.  Each marker: {id, time, name, note, created_at}.
+
+    def _markers_path(self, file_id: str) -> str:
+        return self._analysis_path(file_id, "markers")
+
+    def get_markers(self, file_id: str) -> List[Dict[str, Any]]:
+        doc = read_json(self._markers_path(file_id), None)
+        markers = (doc or {}).get("data", {}).get("markers", [])
+        return sorted(markers, key=lambda m: m.get("time", 0.0))
+
+    def _mutate_markers(self, file_id: str, fn: Callable[[List[Dict[str, Any]]], Any],
+                        create: bool = False) -> Any:
+        """Read-modify-write the markers document under its advisory lock.
+
+        ``fn`` receives the mutable marker list and its return value is passed
+        back to the caller.  When the document does not exist yet it is only
+        created if ``create`` is true; otherwise ``None`` is returned.
+        """
+        path = self._markers_path(file_id)
+        with locked(path + ".lock"):
+            doc = read_json(path, None)
+            if doc is None:
+                if not create:
+                    return None
+                doc = {"file_id": file_id, "kind": "markers",
+                       "created_at": now_iso(), "params": {}, "data": {}}
+            markers = doc.setdefault("data", {}).setdefault("markers", [])
+            result = fn(markers)
+            markers.sort(key=lambda m: m.get("time", 0.0))
+            doc["updated_at"] = now_iso()
+            atomic_write(path, doc)
+
+        # Record the kind on the library entry so delete_file() cleans it up.
+        def _record(lib: Dict[str, Any]) -> None:
+            entry = lib.get("files", {}).get(file_id)
+            if entry is None:
+                return
+            kinds = entry.setdefault("analyses", [])
+            if "markers" not in kinds:
+                kinds.append("markers")
+
+        self._update_library(_record)
+        return result
+
+    def add_marker(self, file_id: str, time_s: float, name: str,
+                   note: str = "") -> Dict[str, Any]:
+        marker = {
+            "id": new_id()[:8],
+            "time": round(float(time_s), 3),
+            "name": name,
+            "note": note,
+            "created_at": now_iso(),
+        }
+        self._mutate_markers(file_id, lambda ms: ms.append(marker), create=True)
+        return marker
+
+    def update_marker(self, file_id: str, marker_id: str,
+                      patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        def _upd(markers: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            for m in markers:
+                if m.get("id") == marker_id:
+                    if "name" in patch:
+                        m["name"] = patch["name"]
+                    if "note" in patch:
+                        m["note"] = patch["note"]
+                    if "time" in patch:
+                        m["time"] = round(float(patch["time"]), 3)
+                    m["updated_at"] = now_iso()
+                    return m
+            return None
+
+        return self._mutate_markers(file_id, _upd)
+
+    def delete_marker(self, file_id: str, marker_id: str) -> bool:
+        def _del(markers: List[Dict[str, Any]]) -> bool:
+            before = len(markers)
+            markers[:] = [m for m in markers if m.get("id") != marker_id]
+            return len(markers) != before
+
+        return bool(self._mutate_markers(file_id, _del))
+
     # -- projects --------------------------------------------------------- #
 
     def _project_path(self, project_id: str) -> str:

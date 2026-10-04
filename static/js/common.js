@@ -126,6 +126,90 @@ function drawWaveform(canvas, env, opts = {}) {
   ctx.stroke();
 }
 
+/* ----------------------------------------------------------------- markers */
+
+/**
+ * Draw waveform markers (vertical line + flag + name label) over an
+ * already-rendered waveform.  Labels are assigned to staggered lanes so
+ * densely-placed markers stay readable; markers very close to the file
+ * start/end get clamped positions and flipped flags/labels so they remain
+ * fully visible.  Returns a layout array for hit-testing:
+ *
+ *   [{ id, x, flag: {x0,y0,x1,y1}, label: {x0,y0,x1,y1} | null }]
+ */
+function drawMarkersOverlay(canvas, markers, duration, opts = {}) {
+  const { ctx, w, h } = setupCanvas(canvas);
+  const layout = [];
+  if (!markers || !markers.length || !(duration > 0)) return layout;
+
+  const color = opts.color || getComputedStyle(document.documentElement)
+    .getPropertyValue("--amber").trim() || "#d29922";
+  const xFor = (t) => Math.max(1, Math.min(w - 1, (t / duration) * w));
+
+  // vertical lines + flag triangles (flags point inwards near the edges)
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 1.4;
+  for (const m of markers) {
+    const x = xFor(m.time);
+    const flip = x + 9 > w;
+    ctx.globalAlpha = 0.75;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    if (flip) { ctx.moveTo(x, 0); ctx.lineTo(x - 8, 4.5); ctx.lineTo(x, 9); }
+    else { ctx.moveTo(x, 0); ctx.lineTo(x + 8, 4.5); ctx.lineTo(x, 9); }
+    ctx.closePath(); ctx.fill();
+    layout.push({
+      id: m.id, x, name: m.name,
+      flag: { x0: flip ? x - 8 : x, y0: 0, x1: flip ? x : x + 8, y1: 9 },
+      label: null,
+    });
+  }
+
+  // name labels with lane-based collision avoidance
+  ctx.font = "10px sans-serif";
+  ctx.textBaseline = "top";
+  const maxLanes = opts.maxLanes || 3;
+  const laneEnds = [];   // right edge of the last label in each lane
+  const ordered = layout.slice().sort((a, b) => a.x - b.x);
+  for (const L of ordered) {
+    let text = String(L.name || "");
+    const maxTw = 110;
+    if (ctx.measureText(text).width > maxTw) {
+      while (text.length > 1 && ctx.measureText(text + "…").width > maxTw) {
+        text = text.slice(0, -1);
+      }
+      text += "…";
+    }
+    let tw = ctx.measureText(text).width;
+    const padX = 4, pillH = 14, pillW = tw + padX * 2;
+    let lx = L.x + 5;
+    if (lx + pillW > w - 2) lx = L.x - 5 - pillW;   // flip left near right edge
+    lx = Math.max(2, Math.min(lx, w - pillW - 2));  // keep inside the canvas
+    let lane = -1;
+    for (let i = 0; i < laneEnds.length; i++) {
+      if (lx > laneEnds[i] + 3) { lane = i; break; }
+    }
+    if (lane === -1) {
+      if (laneEnds.length >= maxLanes) continue;    // too dense → flag only
+      lane = laneEnds.length;
+      laneEnds.push(0);
+    }
+    const ly = 12 + lane * (pillH + 3);
+    laneEnds[lane] = lx + pillW;
+    ctx.fillStyle = "rgba(13,17,23,0.82)";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(lx, ly, pillW, pillH, 4);
+    else ctx.rect(lx, ly, pillW, pillH);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.fillText(text, lx + padX, ly + 2);
+    L.label = { x0: lx, y0: ly, x1: lx + pillW, y1: ly + pillH };
+  }
+  return layout;
+}
+
 /* ----------------------------------------------------------- spectrogram */
 
 function drawSpectrogram(canvas, spec, opts = {}) {

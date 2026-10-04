@@ -393,6 +393,90 @@ def api_edit(file_id: str):
 
 
 # --------------------------------------------------------------------------- #
+# Waveform markers
+# --------------------------------------------------------------------------- #
+
+def _clamp_marker_time(entry: Dict, raw) -> Optional[float]:
+    """Validate ``raw`` as a marker time and clamp it into [0, duration]."""
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(t):
+        return None
+    duration = float(entry.get("duration") or 0.0)
+    if duration > 0:
+        t = min(t, duration)
+    return max(0.0, t)
+
+
+@app.get("/api/audio/<file_id>/markers")
+def api_markers_list(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    return jsonify({
+        "file_id": file_id,
+        "duration": entry.get("duration", 0.0),
+        "markers": store.get_markers(file_id),
+    })
+
+
+@app.post("/api/audio/<file_id>/markers")
+def api_markers_add(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    t = _clamp_marker_time(entry, data.get("time", 0.0))
+    if t is None:
+        return jsonify(error="invalid time"), 400
+    name = str(data.get("name") or "").strip()[:80]
+    note = str(data.get("note") or "").strip()[:500]
+    if not name:
+        name = f"标记 {len(store.get_markers(file_id)) + 1}"
+    marker = store.add_marker(file_id, t, name, note)
+    return jsonify(marker), 201
+
+
+@app.patch("/api/audio/<file_id>/markers/<marker_id>")
+def api_markers_update(file_id: str, marker_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    patch: Dict = {}
+    if "name" in data:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return jsonify(error="name cannot be empty"), 400
+        patch["name"] = name[:80]
+    if "note" in data:
+        patch["note"] = str(data.get("note") or "").strip()[:500]
+    if "time" in data:
+        t = _clamp_marker_time(entry, data["time"])
+        if t is None:
+            return jsonify(error="invalid time"), 400
+        patch["time"] = t
+    if not patch:
+        return jsonify(error="nothing to update"), 400
+    marker = store.update_marker(file_id, marker_id, patch)
+    if marker is None:
+        return jsonify(error="marker not found"), 404
+    return jsonify(marker)
+
+
+@app.delete("/api/audio/<file_id>/markers/<marker_id>")
+def api_markers_delete(file_id: str, marker_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    if not store.delete_marker(file_id, marker_id):
+        return jsonify(error="marker not found"), 404
+    return jsonify(ok=True)
+
+
+# --------------------------------------------------------------------------- #
 # Analysis
 # --------------------------------------------------------------------------- #
 
