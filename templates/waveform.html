@@ -1,10 +1,18 @@
 {% extends "base.html" %}
 {% block title %}波形编辑{% endblock %}
+{% block head %}
+<style>
+  #markerTable tr.selected td { background: var(--amber-soft); }
+  #markerTable input[type="text"] { width: 100%; padding: 4px 7px; font-size: 12px; }
+  #markerTable .mk-name { font-weight: 600; }
+  .mk-jump { cursor: pointer; }
+</style>
+{% endblock %}
 {% block content %}
 <div class="main-head">
   <div>
     <h1>波形显示与编辑</h1>
-    <div class="sub">最小/最大包络波形渲染 · 区域选择 · 裁剪/静音/淡化/增益/归一化/反转</div>
+    <div class="sub">最小/最大包络波形渲染 · 区域选择 · 裁剪/静音/淡化/增益/归一化/反转 · 标记点命名/备注/跳转</div>
   </div>
   <div class="row">
     <select id="fileSel" style="min-width:220px"></select>
@@ -16,6 +24,7 @@
   <div class="row between mb">
     <div class="row">
       <button id="playBtn">▶ 播放</button>
+      <button id="addMarkerBtn" title="在当前播放位置添加一个标记">⚑ 在播放头添加标记</button>
       <span id="timeLabel" class="mono muted">0:00.0 / 0:00.0</span>
     </div>
     <div class="row small muted">
@@ -30,8 +39,22 @@
       <span><span class="dot" style="background:var(--accent)"></span>波形包络</span>
       <span><span class="dot" style="background:var(--accent);opacity:.3"></span>选区</span>
       <span><span class="dot" style="background:var(--green)"></span>播放头</span>
+      <span><span class="dot" style="background:var(--amber)"></span>标记点</span>
     </div>
   </div>
+  <div class="small muted mt">单击波形移动播放头 · 单击标记跳转到该处播放 · 双击波形在该位置添加标记</div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">标记点 <span class="badge amber" id="markerCount">0</span></h2>
+    <span class="small muted">名称与备注可直接编辑，自动保存；重新打开文件后标记依然存在</span>
+  </div>
+  <table id="markerTableWrap">
+    <thead><tr><th style="width:30px"></th><th>名称</th><th style="width:90px">时间</th><th>备注</th><th style="width:160px">操作</th></tr></thead>
+    <tbody id="markerTable"></tbody>
+  </table>
+  <div class="small muted hidden" id="markerEmpty">暂无标记 — 点击「⚑ 在播放头添加标记」或双击波形任意位置添加。</div>
 </div>
 
 <div class="card">
@@ -47,7 +70,7 @@
     <label class="field inline">淡出(s) <input type="number" id="fadeOut" value="0.5" min="0" max="10" step="0.1" style="width:70px"/></label>
     <label class="field inline">增益(dB) <input type="number" id="gainDb" value="6" min="-60" max="60" style="width:70px"/></label>
   </div>
-  <div class="mt small muted">每个操作都会生成一个新文件（保留原文件），新文件可在下方结果中选择。</div>
+  <div class="mt small muted">每个操作都会生成一个新文件（保留原文件），新文件可在下方结果中选择。标记点属于原文件，不会复制到新文件。</div>
 </div>
 
 <div class="card hidden" id="resultCard">
@@ -60,6 +83,7 @@
 <script>
 let env = null, selStart = null, selEnd = null, dragging = false;
 let currentId = null;
+let markers = [], markerHits = [], selectedMarkerId = null;
 const audio = new Audio();
 
 async function loadFiles(selected) {
@@ -75,48 +99,233 @@ async function loadWave() {
   currentId = id;
   env = await API.get(`/api/audio/${id}/waveform?points=3000`);
   selStart = selEnd = null;
+  selectedMarkerId = null;
   audio.src = API.fileUrl(id);
   $("#waveInfo").textContent =
     `${env.duration.toFixed(2)}s · ${env.sr} Hz · ${env.channels} 声道 · ${env.points} 采样点`;
   $("#timeLabel").textContent = `0:00.0 / ${fmtTime(env.duration)}`;
+  await loadMarkers();
   draw();
 }
 
+/* ------------------------------------------------------------- markers */
+
+async function loadMarkers() {
+  try {
+    const res = await API.get(`/api/audio/${currentId}/markers`);
+    markers = (res.markers || []).slice();
+  } catch (_) { markers = []; }
+  markers.sort((a, b) => a.time - b.time);
+  renderMarkers();
+}
+
+function renderMarkers() {
+  $("#markerCount").textContent = markers.length;
+  $("#markerEmpty").classList.toggle("hidden", markers.length > 0);
+  $("#markerTableWrap").classList.toggle("hidden", markers.length === 0);
+  $("#markerTable").innerHTML = markers.map(m => `
+    <tr data-id="${m.id}" class="${m.id === selectedMarkerId ? "selected" : ""}">
+      <td><span class="dot" style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--amber)"></span></td>
+      <td><input type="text" class="mk-name" maxlength="80" value="${esc(m.name)}" title="修改名称，回车或移开焦点保存"/></td>
+      <td class="mono"><a class="mk-jump" title="跳转到该位置播放">${fmtTime(m.time)}</a></td>
+      <td><input type="text" class="mk-note" maxlength="500" placeholder="备注…" value="${esc(m.note || "")}" title="修改备注，回车或移开焦点保存"/></td>
+      <td>
+        <button class="btn-sm mk-play" title="跳转到该标记并播放">▶ 跳转</button>
+        <button class="btn-sm btn-danger mk-del" title="删除该标记">删除</button>
+      </td>
+    </tr>`).join("");
+}
+
+async function addMarkerAt(time) {
+  if (!currentId || !env) return;
+  time = Math.max(0, Math.min(env.duration || 0, time));
+  try {
+    const m = await API.post(`/api/audio/${currentId}/markers`, {
+      time, name: `标记 ${markers.length + 1}`, note: "",
+    });
+    markers.push(m);
+    markers.sort((a, b) => a.time - b.time);
+    selectedMarkerId = m.id;
+    renderMarkers();
+    draw();
+    toast(`已添加标记「${m.name}」@ ${fmtTime(m.time)}`, "success");
+    // 聚焦名称输入框，方便立即改名
+    const input = $(`#markerTable tr[data-id="${m.id}"] .mk-name`);
+    if (input) { input.focus(); input.select(); }
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function updateMarker(id, patch) {
+  try {
+    const m = await API.patch(`/api/audio/${currentId}/markers/${id}`, patch);
+    const i = markers.findIndex(x => x.id === id);
+    if (i >= 0) markers[i] = m;
+    markers.sort((a, b) => a.time - b.time);
+    renderMarkers();
+    draw();
+    toast("标记已保存", "success");
+  } catch (e) {
+    toast(e.message, "error");
+    renderMarkers();  // 还原输入框内容
+  }
+}
+
+async function deleteMarker(id) {
+  const m = markers.find(x => x.id === id);
+  try {
+    await API.del(`/api/audio/${currentId}/markers/${id}`);
+    markers = markers.filter(x => x.id !== id);
+    if (selectedMarkerId === id) selectedMarkerId = null;
+    renderMarkers();
+    draw();
+    toast(`已删除标记「${m ? m.name : ""}」`, "success");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function seekAndPlay(t, autoplay) {
+  const doSeek = () => {
+    try { audio.currentTime = t; } catch (_) { /* metadata not ready */ }
+    if (autoplay) audio.play().catch(() => toast("无法播放该音频", "error"));
+  };
+  if (audio.readyState >= 1) doSeek();
+  else audio.addEventListener("loadedmetadata", doSeek, { once: true });
+}
+
+function jumpToMarker(id, autoplay = true) {
+  const m = markers.find(x => x.id === id);
+  if (!m || !env) return;
+  selectedMarkerId = id;
+  const dur = audio.duration || env.duration || 0;
+  let t = Math.max(0, Math.min(m.time, dur || m.time));
+  // 紧贴文件结尾的标记：略微回退，保证跳转后仍能听到声音
+  if (autoplay && dur > 0 && t >= dur) t = Math.max(0, dur - 0.05);
+  seekAndPlay(t, autoplay);
+  renderMarkers();
+  draw();
+  const tr = $(`#markerTable tr[data-id="${id}"]`);
+  if (tr) tr.scrollIntoView({ block: "nearest" });
+}
+
+/* 命中检测：优先标签/旗标区域，其次取最近的竖线（±6px） */
+function hitMarker(px, py) {
+  for (let i = markerHits.length - 1; i >= 0; i--) {
+    const r = markerHits[i];
+    if (r.kind === "label" && px >= r.x0 && px <= r.x1 && py >= r.y0 && py <= r.y1) return r.id;
+  }
+  let best = null, bestD = 6;
+  for (const r of markerHits) {
+    if (r.kind !== "line") continue;
+    const d = Math.abs(px - r.x);
+    if (d < bestD) { bestD = d; best = r.id; }
+  }
+  return best;
+}
+
+$("#addMarkerBtn").addEventListener("click", () => addMarkerAt(audio.currentTime || 0));
+
+$("#markerTable").addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  const id = tr.dataset.id;
+  if (e.target.closest(".mk-del")) return deleteMarker(id);
+  if (e.target.closest(".mk-jump") || e.target.closest(".mk-play")) return jumpToMarker(id, true);
+});
+$("#markerTable").addEventListener("change", e => {
+  const tr = e.target.closest("tr[data-id]");
+  if (!tr) return;
+  const id = tr.dataset.id;
+  const m = markers.find(x => x.id === id);
+  if (!m) return;
+  if (e.target.classList.contains("mk-name")) {
+    const name = e.target.value.trim();
+    if (!name) { e.target.value = m.name; return toast("名称不能为空", "warn"); }
+    if (name !== m.name) updateMarker(id, { name });
+  } else if (e.target.classList.contains("mk-note")) {
+    if (e.target.value !== (m.note || "")) updateMarker(id, { note: e.target.value });
+  }
+});
+$("#markerTable").addEventListener("keydown", e => {
+  if (e.key === "Enter" && e.target.matches("input")) e.target.blur();
+});
+
+/* -------------------------------------------------------------- canvas */
+
 function draw() {
-  const c = $("#wave");
-  drawWaveform(c, env, {
+  if (!env) return;
+  const res = drawWaveform($("#wave"), env, {
     selection: (selStart != null && selEnd != null) ? [Math.min(selStart, selEnd), Math.max(selStart, selEnd)] : null,
     playhead: audio.duration ? audio.currentTime / audio.duration : null,
+    markers,
+    selectedMarker: selectedMarkerId,
   });
+  markerHits = (res && res.markerHits) || [];
 }
 
 const wave = $("#wave");
+let downPos = null, dragMoved = false;
+
 wave.addEventListener("mousedown", e => {
   const r = wave.getBoundingClientRect();
+  downPos = { x: e.clientX, y: e.clientY };
+  dragMoved = false;
   dragging = true;
   selStart = (e.clientX - r.left) / r.width;
   selEnd = selStart;
   draw();
 });
 window.addEventListener("mousemove", e => {
-  if (!dragging) return;
+  if (!dragging) { hoverCursor(e); return; }
+  if (downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 4) dragMoved = true;
   const r = wave.getBoundingClientRect();
   selEnd = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
   updateSelLabel();
   draw();
 });
-window.addEventListener("mouseup", () => { dragging = false; });
+window.addEventListener("mouseup", e => {
+  if (!dragging) return;
+  dragging = false;
+  if (!dragMoved && env) {
+    // 单击（未拖拽）：命中标记则跳转播放，否则移动播放头
+    const r = wave.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const hitId = hitMarker(px, py);
+    selStart = selEnd = null;
+    updateSelLabel();
+    if (hitId) { jumpToMarker(hitId, true); return; }
+    if (audio.duration) audio.currentTime = Math.max(0, Math.min(1, px / r.width)) * audio.duration;
+    draw();
+  }
+});
+wave.addEventListener("dblclick", e => {
+  if (!env) return;
+  const r = wave.getBoundingClientRect();
+  const px = e.clientX - r.left, py = e.clientY - r.top;
+  if (hitMarker(px, py)) return;  // 双击已有标记时不重复添加
+  addMarkerAt(Math.max(0, Math.min(1, px / r.width)) * env.duration);
+});
+
+function hoverCursor(e) {
+  if (!env) return;
+  const r = wave.getBoundingClientRect();
+  const px = e.clientX - r.left, py = e.clientY - r.top;
+  if (px < 0 || px > r.width || py < 0 || py > r.height) { wave.style.cursor = ""; return; }
+  wave.style.cursor = hitMarker(px, py) ? "pointer" : "crosshair";
+}
 
 function updateSelLabel() {
+  if (selStart == null || selEnd == null) { $("#selLabel").textContent = "未选择区域（在波形上拖拽选择）"; return; }
   const a = Math.min(selStart, selEnd), b = Math.max(selStart, selEnd);
   if (b - a < 0.001) { $("#selLabel").textContent = "未选择区域（在波形上拖拽选择）"; return; }
   $("#selLabel").textContent = `选区 ${fmtTime(a * env.duration)} – ${fmtTime(b * env.duration)} (${((b - a) * env.duration).toFixed(2)}s)`;
 }
 
 $("#playBtn").addEventListener("click", () => {
-  if (audio.paused) { audio.play(); $("#playBtn").textContent = "⏸ 暂停"; }
-  else { audio.pause(); $("#playBtn").textContent = "▶ 播放"; }
+  if (audio.paused) audio.play().catch(() => toast("无法播放该音频", "error"));
+  else audio.pause();
 });
+audio.addEventListener("play", () => { $("#playBtn").textContent = "⏸ 暂停"; });
+audio.addEventListener("pause", () => { $("#playBtn").textContent = "▶ 播放"; });
+audio.addEventListener("ended", () => { $("#playBtn").textContent = "▶ 播放"; });
 audio.addEventListener("timeupdate", () => {
   $("#timeLabel").textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration)}`;
   draw();

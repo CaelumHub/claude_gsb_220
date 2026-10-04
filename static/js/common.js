@@ -85,11 +85,121 @@ function colorStyle(t) {
 
 /* ------------------------------------------------------------- waveform */
 
+/**
+ * Draw named timeline markers (flag + label + vertical line) over a waveform.
+ *
+ * Labels are placed on up to MAX_ROWS staggered rows (greedy, left to right)
+ * so dense clusters stay legible; labels flip to the left of their flag and
+ * clamp to the canvas edge so markers very close to the start/end of the
+ * file remain fully visible.  Markers that cannot get a label row still draw
+ * their line and flag.
+ *
+ * Returns hit regions for click detection:
+ *   [{kind:"label", id, x0,y0,x1,y1}, ..., {kind:"line", id, x}, ...]
+ */
+function drawMarkersOverlay(ctx, w, h, markers, duration, selectedId) {
+  const hits = [];
+  if (!markers || !markers.length || !(duration > 0)) return hits;
+  const amber = getComputedStyle(document.documentElement)
+    .getPropertyValue("--amber").trim() || "#d29922";
+  const sorted = markers.slice().sort((a, b) => a.time - b.time);
+  const MAX_ROWS = 4, ROW_H = 16, PILL_H = 13, FLAG_W = 8;
+  const rowEnds = [];      // right-most occupied x per label row
+  const flagRowEnds = [];  // right-most occupied x per flag-only overflow row
+  ctx.font = "10px sans-serif";
+
+  for (const m of sorted) {
+    const selected = m.id === selectedId;
+    const frac = Math.max(0, Math.min(1, (m.time || 0) / duration));
+    const x = Math.max(0, Math.min(w - 1, Math.round(frac * w)));
+    const name = String(m.name == null ? "" : m.name);
+    const pillW = ctx.measureText(name).width + 8;
+    // Flip flag+label to the left of the line when the right edge is near.
+    const dir = (x + FLAG_W + 4 + pillW > w - 2) ? -1 : 1;
+    let lx = dir > 0 ? x + FLAG_W + 4 : x - FLAG_W - 4 - pillW;
+    lx = Math.max(2, Math.min(w - pillW - 2, lx));
+
+    // A marker occupies the union of its flag and label extents; rows are
+    // non-overlapping interval sets, filled left to right.
+    const occ0 = Math.min(x, lx) - 2;
+    const occ1 = Math.max(x + FLAG_W, lx + pillW) + 2;
+    let row = -1;
+    for (let r = 0; r < MAX_ROWS; r++) {
+      if (rowEnds[r] === undefined || occ0 > rowEnds[r]) { row = r; break; }
+    }
+    if (row >= 0) rowEnds[row] = occ1;
+
+    // Flags of markers that got no label row are staggered across rows too,
+    // so even extreme clusters stay as distinguishable as the pixels allow.
+    let flagRow;
+    if (row >= 0) {
+      flagRow = row;
+    } else {
+      flagRow = 0;
+      const fx1 = x + FLAG_W + 2;
+      for (let r = 0; r < MAX_ROWS; r++) {
+        if (flagRowEnds[r] === undefined || x - 2 > flagRowEnds[r]) { flagRow = r; break; }
+        if (flagRowEnds[r] < flagRowEnds[flagRow]) flagRow = r;
+      }
+      flagRowEnds[flagRow] = Math.max(flagRowEnds[flagRow] || 0, fx1);
+    }
+    const py = 2 + flagRow * ROW_H;
+
+    // vertical line across the whole waveform
+    ctx.save();
+    ctx.globalAlpha = selected ? 0.95 : 0.5;
+    ctx.fillStyle = amber;
+    ctx.fillRect(x, 0, selected ? 2 : 1, h);
+    ctx.restore();
+    hits.push({ kind: "line", id: m.id, x });
+
+    // flag triangle at the top of the line
+    ctx.fillStyle = amber;
+    ctx.beginPath();
+    ctx.moveTo(x, py);
+    ctx.lineTo(x + FLAG_W * dir, py + 4.5);
+    ctx.lineTo(x, py + 9);
+    ctx.closePath();
+    ctx.fill();
+
+    if (row >= 0) {
+      // name label on a dark pill (inverted when selected)
+      if (selected) {
+        ctx.fillStyle = amber;
+        ctx.fillRect(lx, py, pillW, PILL_H);
+        ctx.fillStyle = "#0e1116";
+      } else {
+        ctx.fillStyle = "rgba(13,17,23,0.82)";
+        ctx.fillRect(lx, py, pillW, PILL_H);
+        ctx.fillStyle = amber;
+      }
+      ctx.textBaseline = "middle";
+      ctx.fillText(name, lx + 4, py + PILL_H / 2 + 0.5);
+      ctx.textBaseline = "alphabetic";
+      hits.push({
+        kind: "label", id: m.id,
+        x0: Math.max(0, Math.min(lx, dir > 0 ? x : x - FLAG_W) - 2),
+        y0: py - 1,
+        x1: Math.min(w, Math.max(lx + pillW, dir > 0 ? x + FLAG_W : x) + 2),
+        y1: py + PILL_H + 1,
+      });
+    } else {
+      // no label row left: the flag alone is the click target
+      hits.push({
+        kind: "label", id: m.id,
+        x0: Math.min(x, x + FLAG_W * dir) - 2, y0: py - 1,
+        x1: Math.max(x, x + FLAG_W * dir) + 2, y1: py + 10,
+      });
+    }
+  }
+  return hits;
+}
+
 function drawWaveform(canvas, env, opts = {}) {
   const { ctx, w, h } = setupCanvas(canvas);
   const mins = env.mins || [], maxs = env.maxs || [];
   ctx.clearRect(0, 0, w, h);
-  if (!mins.length) return;
+  if (!mins.length) return null;
 
   const color = opts.color || getComputedStyle(document.documentElement)
     .getPropertyValue("--accent").trim() || "#58a6ff";
@@ -124,6 +234,15 @@ function drawWaveform(canvas, env, opts = {}) {
   ctx.beginPath();
   ctx.moveTo(0, mid); ctx.lineTo(w, mid);
   ctx.stroke();
+
+  // marker overlay on top of everything; hit regions are returned so callers
+  // can implement click-to-jump without re-doing the layout math.
+  let markerHits = null;
+  if (opts.markers && opts.markers.length) {
+    markerHits = drawMarkersOverlay(ctx, w, h, opts.markers,
+                                    env.duration || 0, opts.selectedMarker);
+  }
+  return { markerHits };
 }
 
 /* ----------------------------------------------------------- spectrogram */

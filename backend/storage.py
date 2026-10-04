@@ -216,8 +216,9 @@ class Storage:
             # Remove analyses (best-effort glob).
             for kind in entry.get("analyses", []):
                 ap = self._analysis_path(file_id, kind)
-                if os.path.isfile(ap):
-                    os.unlink(ap)
+                for p in (ap, ap + ".lock"):
+                    if os.path.isfile(p):
+                        os.unlink(p)
             # Remove version snapshots for this file.
             for vp in self._version_glob(file_id):
                 if os.path.isfile(vp):
@@ -263,6 +264,40 @@ class Storage:
 
     def get_analysis(self, file_id: str, kind: str) -> Optional[Dict[str, Any]]:
         return read_json(self._analysis_path(file_id, kind), None)
+
+    def update_analysis(self, file_id: str, kind: str,
+                        fn: Callable[[Dict[str, Any]], Any]) -> Any:
+        """Read-modify-write an analysis document atomically under its lock.
+
+        ``fn`` receives the mutable ``data`` dict and its return value becomes
+        the return value of this method.  Unlike :meth:`save_analysis` (which
+        overwrites the whole document), this serialises concurrent
+        read-modify-write cycles (e.g. adding / renaming / deleting individual
+        waveform markers) so simultaneous requests cannot lose each other's
+        updates.
+        """
+        path = self._analysis_path(file_id, kind)
+        with locked(path + ".lock"):
+            doc = read_json(path, None) or {
+                "file_id": file_id,
+                "kind": kind,
+                "created_at": now_iso(),
+                "params": {},
+                "data": {},
+            }
+            result = fn(doc.setdefault("data", {}))
+            atomic_write(path, doc)
+
+        def _record(lib: Dict[str, Any]) -> None:
+            entry = lib.get("files", {}).get(file_id)
+            if entry is None:
+                return
+            kinds = entry.setdefault("analyses", [])
+            if kind not in kinds:
+                kinds.append(kind)
+
+        self._update_library(_record)
+        return result
 
     # -- projects --------------------------------------------------------- #
 

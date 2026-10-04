@@ -302,6 +302,115 @@ def api_samples(file_id: str):
 
 
 # --------------------------------------------------------------------------- #
+# Waveform markers (named cue points with notes, persisted per file)
+# --------------------------------------------------------------------------- #
+
+MARKER_KIND = "markers"
+_MARKER_NAME_MAX = 80
+_MARKER_NOTE_MAX = 500
+
+
+def _clamp_time(value, entry: Dict) -> float:
+    """Clamp a marker time to the file's [0, duration] range."""
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        t = 0.0
+    dur = float(entry.get("duration") or 0.0)
+    if dur > 0:
+        t = min(t, dur)
+    return max(0.0, t)
+
+
+def _clean_name(value, fallback: str) -> str:
+    name = str(value or "").strip()[:_MARKER_NAME_MAX]
+    return name or fallback
+
+
+def _clean_note(value) -> str:
+    return str(value or "")[:_MARKER_NOTE_MAX]
+
+
+@app.get("/api/audio/<file_id>/markers")
+def api_list_markers(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    doc = store.get_analysis(file_id, MARKER_KIND)
+    markers = (doc or {}).get("data", {}).get("markers", [])
+    markers = sorted(markers, key=lambda m: m.get("time", 0.0))
+    return jsonify({"markers": markers})
+
+
+@app.post("/api/audio/<file_id>/markers")
+def api_add_marker(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+
+    def _add(doc: Dict) -> Dict:
+        markers = doc.setdefault("markers", [])
+        marker = {
+            "id": storage.new_id(),
+            "time": _clamp_time(data.get("time", 0.0), entry),
+            "name": _clean_name(data.get("name"), f"标记 {len(markers) + 1}"),
+            "note": _clean_note(data.get("note")),
+            "created_at": storage.now_iso(),
+        }
+        markers.append(marker)
+        markers.sort(key=lambda m: m["time"])
+        return marker
+
+    return jsonify(store.update_analysis(file_id, MARKER_KIND, _add))
+
+
+@app.patch("/api/audio/<file_id>/markers/<marker_id>")
+def api_update_marker(file_id: str, marker_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+
+    def _patch(doc: Dict) -> Optional[Dict]:
+        markers = doc.setdefault("markers", [])
+        for m in markers:
+            if m.get("id") == marker_id:
+                if "time" in data:
+                    m["time"] = _clamp_time(data.get("time"), entry)
+                if "name" in data:
+                    m["name"] = _clean_name(data.get("name"), m.get("name") or "标记")
+                if "note" in data:
+                    m["note"] = _clean_note(data.get("note"))
+                m["updated_at"] = storage.now_iso()
+                markers.sort(key=lambda x: x["time"])
+                return m
+        return None
+
+    marker = store.update_analysis(file_id, MARKER_KIND, _patch)
+    if marker is None:
+        return jsonify(error="marker not found"), 404
+    return jsonify(marker)
+
+
+@app.delete("/api/audio/<file_id>/markers/<marker_id>")
+def api_delete_marker(file_id: str, marker_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+
+    def _del(doc: Dict) -> bool:
+        markers = doc.setdefault("markers", [])
+        kept = [m for m in markers if m.get("id") != marker_id]
+        doc["markers"] = kept
+        return len(kept) < len(markers)
+
+    if not store.update_analysis(file_id, MARKER_KIND, _del):
+        return jsonify(error="marker not found"), 404
+    return jsonify(ok=True)
+
+
+# --------------------------------------------------------------------------- #
 # Waveform edits
 # --------------------------------------------------------------------------- #
 
